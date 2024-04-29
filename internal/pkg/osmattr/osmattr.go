@@ -285,9 +285,10 @@ func FetchAllTags(tbl string, db *sql.DB) []string {
 func isTblExist(tbl string, db *sql.DB) bool {
 	// Check if the table exists
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", tbl).Scan(&count)
+	row := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", tbl)
+	err := row.Scan(&count)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln(err)
 	}
 	if count == 0 {
 		return false
@@ -304,9 +305,10 @@ func isColExist(tbl string, col string, db *sql.DB) bool {
 
 	// Check if the column exists in the table
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", tbl, col).Scan(&count)
+	row := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", tbl, col)
+	err := row.Scan(&count)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln(err)
 	}
 	if count == 0 {
 		return false

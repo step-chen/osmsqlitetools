@@ -101,14 +101,14 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 
 		var (
 			rfID     int64
-			lineIDs  []int
+			lineIDs  []sql.NullInt32
 			orderIDs []int
 		)
 
 		strCols := getColsSql(tmpTblName, db)
 		for rowsNodes.Next() {
 			var (
-				lineID  int
+				lineID  sql.NullInt32
 				orderID int
 			)
 			if err := rowsNodes.Scan(&rfID, &lineID, &orderID); err != nil {
@@ -121,7 +121,7 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 			if lastRFID != rfID {
 				split(lastRFID, lineIDs, orderIDs, strCols, tmpTblName, c, db, tx)
 				lastRFID = rfID
-				lineIDs = []int{}
+				lineIDs = []sql.NullInt32{}
 				orderIDs = []int{}
 				lineIDs = append(lineIDs, lineID)
 				orderIDs = append(orderIDs, orderID)
@@ -147,7 +147,7 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 	}
 }
 
-func split(ogcFid int64, lineIDs []int, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, db *sql.DB, tx *sql.Tx) {
+func split(ogcFid int64, lineIDs []sql.NullInt32, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, db *sql.DB, tx *sql.Tx) {
 	strSql := fmt.Sprintf("SELECT AsBinary(GEOMETRY) FROM %s WHERE ogc_fid=?", tblName)
 	row := db.QueryRow(strSql, ogcFid)
 	if row.Err() != nil {
@@ -212,7 +212,7 @@ func splitLine(ogcFid int64, line orb.LineString, pntIDs []int, strCols string, 
 	}
 }
 
-func splitMultiLine(ogcFid int64, mls orb.MultiLineString, lineIDs []int, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, tx *sql.Tx) {
+func splitMultiLine(ogcFid int64, mls orb.MultiLineString, lineIDs []sql.NullInt32, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, tx *sql.Tx) {
 	// osm 9930461
 	ml := make([]orb.MultiLineString, len(lineIDs)+1)
 	l := orb.LineString{}
@@ -224,7 +224,7 @@ func splitMultiLine(ogcFid int64, mls orb.MultiLineString, lineIDs []int, pntIDs
 		if i == count {
 			group[1] = [2]int{len(mls) - 1, len(mls[len(mls)-1]) - 1}
 		} else {
-			group[1] = [2]int{lineIDs[i], pntIDs[i]}
+			group[1] = [2]int{int(lineIDs[i].Int32), pntIDs[i]}
 		}
 
 		for idLS := group[0][0]; idLS <= group[1][0]; idLS++ {
@@ -271,40 +271,15 @@ func splitMultiLine(ogcFid int64, mls orb.MultiLineString, lineIDs []int, pntIDs
 	}
 }
 
-/*
-WITH RECURSIVE split(ogc_fid, osm_id, GEOMETRY, i, geom) AS (
-    SELECT ogc_fid, osm_id, GEOMETRY, 0 AS i, NULL as geom
-    FROM lines
-    UNION ALL
-    SELECT ogc_fid, osm_id, GEOMETRY, i+1, ST_PointN(GEOMETRY, i+1) AS geom
-    FROM split
-    WHERE i < ST_NumPoints(GEOMETRY)
-)
-SELECT ogc_fid AS lines_fid, osm_id, i AS order_id,
-CASE
-    WHEN i == 1 THEN 1
-    WHEN i == ST_NumPoints(GEOMETRY) THEN 2
-    ELSE 0
-END pos_type,
-geom AS GEOMETRY
-FROM split
-WHERE geom IS NOT NULL ORDER BY ogc_fid, i
-*/
 // 332017161 192930 {"type":"LineString","coordinates":[[46.7427034,24.5241916],[46.7480282,24.52049239999999],[46.74831189999999,24.5202774],[46.74895459999999,24.5198424]]}
 // 53433 {"type":"LineString","coordinates":[[46.7482234,24.5207416],[46.7480282,24.52049239999999]]}
 func createNodes(c LinesSplitConfig, db *sql.DB, createOnlyEndpoint bool) {
-	strSql := fmt.Sprintf("SELECT DiscardGeometryColumn('%s', 'GEOMETRY')", c.NodeLayer)
+	strSql := fmt.Sprintf("SELECT DropGeoTable('%s')", c.NodeLayer)
 	_, err := db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
-	strSql = fmt.Sprintf("DROP TABLE IF EXISTS %s", c.NodeLayer)
-	_, err = db.Exec(strSql)
-	if err != nil {
-		log.Fatalln(err)
-	}
 
-	// Assuming the nodes table does not exist and needs to be created
 	strSql = fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (ogc_fid INTEGER PRIMARY KEY AUTOINCREMENT, lines_fid INTEGER, osm_id BIGINT, line_id INTEGER, order_id INTEGER, pos_type INTEGER DEFAULT 0, intersections INTEGER DEFAULT 0)", c.NodeLayer)
 	_, err = db.Exec(strSql)
 	if err != nil {
@@ -316,108 +291,25 @@ func createNodes(c LinesSplitConfig, db *sql.DB, createOnlyEndpoint bool) {
 		log.Fatalln(err)
 	}
 
-	// Query roads geometries
-	strSql = fmt.Sprintf("SELECT ogc_fid, osm_id, AsBinary(GEOMETRY) FROM %s", c.LineLayer)
-	rows, err := db.Query(strSql)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	defer rows.Close()
-
-	tx, err := db.Begin()
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	for rows.Next() {
-		var rfID int64
-		var osmID int64
-		var geomData []byte
-		if err := rows.Scan(&rfID, &osmID, &geomData); err != nil {
-			log.Fatalln(err)
-		}
-
-		geom, err := wkb.Unmarshal(geomData)
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		mls, ok := geom.(orb.MultiLineString)
-		if ok {
-			for lineID, line := range mls {
-				strSql = fmt.Sprintf("INSERT INTO %s (lines_fid, osm_id, line_id, order_id, pos_type, GEOMETRY) VALUES (?, ?, ?, ?, ?, GeomFromText(?))", c.NodeLayer)
-				if createOnlyEndpoint {
-					_, err := tx.Exec(strSql, rfID, osmID, lineID, 0, 1, fmt.Sprintf("POINT(%f %f)", line[0].Lon(), line[0].Lat()))
-					if err != nil {
-						log.Fatalln(err)
-					}
-					_, err = tx.Exec(strSql, rfID, osmID, lineID, 1, 2, fmt.Sprintf("POINT(%f %f)", line[len(line)-1].Lon(), line[len(line)-1].Lat()))
-					if err != nil {
-						log.Fatalln(err)
-					}
-				}
-				for orderID, point := range line {
-					// Insert each point into the nodes table
-					pos_type := 0
-					if orderID == 0 {
-						pos_type = 1
-					} else if orderID == len(line)-1 {
-						pos_type = 2
-					}
-					_, err := tx.Exec(strSql, rfID, osmID, lineID, orderID, pos_type, fmt.Sprintf("POINT(%f %f)", point.Lon(), point.Lat()))
-
-					if err != nil {
-						log.Fatalln(err)
-					}
-				}
-			}
-
-			continue
-		}
-
-		line, ok := geom.(orb.LineString)
-		if ok {
-			strSql = fmt.Sprintf("INSERT INTO %s (lines_fid, osm_id, line_id, order_id, pos_type, GEOMETRY) VALUES (?, ?, ?, ?, ?, GeomFromText(?, 4326))", c.NodeLayer)
-			if createOnlyEndpoint {
-				strPnt := wkt.MarshalString(line[0])
-				_, err := tx.Exec(strSql, rfID, osmID, 0, 0, 1, strPnt)
-				if err != nil {
-					log.Fatalln(err)
-				}
-				strPnt = wkt.MarshalString(line[len(line)-1])
-				_, err = tx.Exec(strSql, rfID, osmID, 0, 1, 2, strPnt)
-				if err != nil {
-					log.Fatalln(err)
-				}
-			} else {
-				for orderID, point := range line {
-					// Insert each point into the nodes table
-					pos_type := 0
-					if orderID == 0 {
-						pos_type = 1
-					} else if orderID == len(line)-1 {
-						pos_type = 2
-					}
-					strPnt := wkt.MarshalString(point)
-					_, err := tx.Exec(strSql, rfID, osmID, 0, orderID, pos_type, strPnt)
-
-					if err != nil {
-						log.Fatalln(err)
-					}
-				}
-			}
-
-			continue
-		}
-
-		log.Fatalln("Geometry is not a MultiLineString or LineString")
-	}
-
-	if err := rows.Err(); err != nil {
-		log.Fatalln(err)
-	}
-
-	err = tx.Commit()
+	strSql = fmt.Sprintf(`WITH RECURSIVE split(ogc_fid, osm_id, GEOMETRY, i, geom) AS (
+		SELECT ogc_fid, osm_id, GEOMETRY, 0 AS i, NULL as geom
+		FROM %s
+		UNION ALL
+		SELECT ogc_fid, osm_id, GEOMETRY, i+1, ST_PointN(GEOMETRY, i+1) AS geom
+		FROM split
+		WHERE i < ST_NumPoints(GEOMETRY)
+	)
+	INSERT INTO %s (lines_fid, osm_id, order_id, pos_type, GEOMETRY)
+	SELECT ogc_fid AS lines_fid, osm_id, i AS order_id,
+	CASE
+		WHEN i == 1 THEN 1
+		WHEN i == ST_NumPoints(GEOMETRY) THEN 2
+		ELSE 0
+	END pos_type,
+	geom AS GEOMETRY
+	FROM split
+	WHERE geom IS NOT NULL ORDER BY ogc_fid, i`, c.LineLayer, c.NodeLayer)
+	_, err = db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}

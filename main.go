@@ -15,7 +15,7 @@ import (
 
 // First to convert osm to spatialite
 // ogr2ogr -f SQLite route.sqlite route.osm -progress -dsco SPATIALITE=YES
-// go run main.go -f "./data/route1.sqlite" -t "./tags.yml" -e "./lines_extract.yml" -s "./lines_split.yml"
+// go run main.go -f "./samples/route1.sqlite" -t "./tags.yml" -e "./lines_extract.yml" -s "./lines_split.yml"
 
 var (
 	showUsage          bool
@@ -63,9 +63,10 @@ func main() {
 		&sqlite3.SQLiteDriver{
 			Extensions: []string{"mod_spatialite"},
 		})
-	db, err := sql.Open("sqlite3_with_spatialite", "file:./data/oem_sample/route1.sqlite?cache=shared&mode=rwc&_fk=1")
+	strSql := fmt.Sprintf("file:%s?cache=shared&mode=rwc&_fk=1", strPathName)
+	db, err := sql.Open("sqlite3_with_spatialite", strSql)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln(err)
 	}
 	defer db.Close()
 
