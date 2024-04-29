@@ -54,8 +54,6 @@ func dropTmpTable(tblName string, db *sql.DB) {
 	}
 }
 
-// CREATE TABLE 'lines' ( "ogc_fid" INTEGER PRIMARY KEY AUTOINCREMENT, 'osm_id' VARCHAR, 'name' VARCHAR, 'highway' VARCHAR, "GEOMETRY" LINESTRING)
-
 // This function creates a temporary table that contains the split lines, with an index on ogc_fid.
 func createTmpTable(c LinesSplitConfig, db *sql.DB) string {
 	tblName := fmt.Sprintf("tmp_%s", c.LineLayer)
@@ -85,7 +83,7 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 
 		tmpTblName := createTmpTable(c, db)
 
-		strSql := fmt.Sprintf("SELECT lines_fid, line_id, order_id FROM %s WHERE intersections > 1 AND pos_type = 0 ORDER BY lines_fid ASC, line_id ASC, order_id ASC", c.NodeLayer)
+		strSql := fmt.Sprintf("SELECT lines_fid, order_id FROM %s WHERE intersections > 1 AND pos_type = 0 ORDER BY lines_fid ASC, order_id ASC", c.NodeLayer)
 		rowsNodes, err := db.Query(strSql)
 		if err != nil {
 			log.Fatalln(err)
@@ -101,17 +99,15 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 
 		var (
 			rfID     int64
-			lineIDs  []sql.NullInt32
 			orderIDs []int
 		)
 
 		strCols := getColsSql(tmpTblName, db)
 		for rowsNodes.Next() {
 			var (
-				lineID  sql.NullInt32
 				orderID int
 			)
-			if err := rowsNodes.Scan(&rfID, &lineID, &orderID); err != nil {
+			if err := rowsNodes.Scan(&rfID, &orderID); err != nil {
 				log.Fatal(err)
 			}
 			if lastRFID == -1 {
@@ -119,19 +115,16 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 			}
 
 			if lastRFID != rfID {
-				split(lastRFID, lineIDs, orderIDs, strCols, tmpTblName, c, db, tx)
+				split(lastRFID, orderIDs, strCols, tmpTblName, c, db, tx)
 				lastRFID = rfID
-				lineIDs = []sql.NullInt32{}
 				orderIDs = []int{}
-				lineIDs = append(lineIDs, lineID)
 				orderIDs = append(orderIDs, orderID)
 			} else {
-				lineIDs = append(lineIDs, lineID)
 				orderIDs = append(orderIDs, orderID)
 			}
 		}
 
-		split(rfID, lineIDs, orderIDs, strCols, tmpTblName, c, db, tx)
+		split(rfID, orderIDs, strCols, tmpTblName, c, db, tx)
 
 		if err := rowsNodes.Err(); err != nil {
 			log.Fatalln(err)
@@ -147,8 +140,8 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 	}
 }
 
-func split(ogcFid int64, lineIDs []sql.NullInt32, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, db *sql.DB, tx *sql.Tx) {
-	strSql := fmt.Sprintf("SELECT AsBinary(GEOMETRY) FROM %s WHERE ogc_fid=?", tblName)
+func split(ogcFid int64, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, db *sql.DB, tx *sql.Tx) {
+	strSql := fmt.Sprintf("SELECT ST_AsBinary(ST_DissolvePoints(GEOMETRY)) FROM %s WHERE ogc_fid=?", tblName)
 	row := db.QueryRow(strSql, ogcFid)
 	if row.Err() != nil {
 		log.Fatalln(row.Err())
@@ -164,95 +157,43 @@ func split(ogcFid int64, lineIDs []sql.NullInt32, pntIDs []int, strCols string, 
 		log.Fatalln(err)
 	}
 
-	mls, ok := geom.(orb.MultiLineString)
-	if ok {
-		splitMultiLine(ogcFid, mls, lineIDs, pntIDs, strCols, tblName, c, tx)
+	mp, ok := geom.(orb.MultiPoint)
+	if !ok {
+		log.Fatalln("Geometry is not a MultiLineString or LineString")
 		return
 	}
-	line, ok := geom.(orb.LineString)
-	if ok {
-		splitLine(ogcFid, line, pntIDs, strCols, tblName, c, tx)
+
+	var splitPnts orb.MultiPoint
+	for _, id := range pntIDs {
+		splitPnts = append(splitPnts, mp[id-1])
+	}
+
+	splitLine(ogcFid, splitPnts, strCols, tblName, c, db, tx)
+}
+
+// 10711
+func splitLine(ogcFid int64, points orb.MultiPoint, strCols string, tblName string, c LinesSplitConfig, db *sql.DB, tx *sql.Tx) {
+	strMp := wkt.MarshalString(points)
+	strSql := fmt.Sprintf("SELECT ST_AsBinary(ST_LinesCutAtNodes(GEOMETRY, GeomFromText(?, 4326))) FROM %s WHERE ogc_fid == ?", tblName)
+	row := db.QueryRow(strSql, strMp, ogcFid)
+	if row.Err() != nil {
+		log.Fatalln(row.Err())
+	}
+
+	var geomData []byte
+	if err := row.Scan(&geomData); err != nil {
+		log.Fatalln(err)
+	}
+
+	geom, err := wkb.Unmarshal(geomData)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	ml, ok := geom.(orb.MultiLineString)
+	if !ok {
+		//log.Fatalln("Geometry is not a MultiLineString or LineString")
 		return
-	}
-	log.Fatalln("Geometry is not a MultiLineString or LineString")
-}
-
-func splitLine(ogcFid int64, line orb.LineString, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, tx *sql.Tx) {
-	// osm 9930461
-	ml := make([]orb.LineString, len(pntIDs)+1)
-	count := len(pntIDs)
-
-	group := [2]int{0, 0}
-	for i := 0; i <= count; i++ {
-		group[0] = group[1]
-		if i == count {
-			group[1] = len(line) - 1
-		} else {
-			group[1] = pntIDs[i]
-		}
-
-		for idP := group[0]; idP <= group[1]; idP++ {
-			ml[i] = append(ml[i], line[idP])
-		}
-	}
-
-	for i, l := range ml {
-		err := error(nil)
-		strMl := wkt.MarshalString(l)
-		if i == 0 {
-			strSql := fmt.Sprintf("UPDATE %s SET GEOMETRY = GeomFromText(?, 4326) WHERE ogc_fid = ?", c.LineLayer)
-			_, err = tx.Exec(strSql, strMl, ogcFid)
-		} else {
-			strSql := fmt.Sprintf(`INSERT INTO %s (%s, GEOMETRY) SELECT %s, GeomFromText(?, 4326) AS GEOMETRY FROM %s WHERE ogc_fid = ?`, c.LineLayer, strCols, strCols, tblName)
-			_, err = tx.Exec(strSql, strMl, ogcFid)
-		}
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}
-}
-
-func splitMultiLine(ogcFid int64, mls orb.MultiLineString, lineIDs []sql.NullInt32, pntIDs []int, strCols string, tblName string, c LinesSplitConfig, tx *sql.Tx) {
-	// osm 9930461
-	ml := make([]orb.MultiLineString, len(lineIDs)+1)
-	l := orb.LineString{}
-	count := len(lineIDs)
-
-	group := [2][2]int{{0, 0}, {0, 0}}
-	for i := 0; i <= count; i++ {
-		group[0] = group[1]
-		if i == count {
-			group[1] = [2]int{len(mls) - 1, len(mls[len(mls)-1]) - 1}
-		} else {
-			group[1] = [2]int{int(lineIDs[i].Int32), pntIDs[i]}
-		}
-
-		for idLS := group[0][0]; idLS <= group[1][0]; idLS++ {
-			line := mls[idLS]
-			if i == count && idLS > group[0][0] {
-				ml[i] = append(ml[i], line)
-			} else if idLS > group[0][0] && idLS < group[1][0] {
-				ml[i] = append(ml[i], line)
-			} else if idLS == group[0][0] {
-				stopIdP := len(line)
-				if idLS == group[1][0] {
-					stopIdP = group[1][1]
-				}
-				for idLP := group[0][1]; idLP <= stopIdP; idLP++ {
-					// for idLP, pnt := range line {
-					pnt := line[idLP]
-					if idLP == group[0][1] {
-						l = orb.LineString{}
-						l = append(l, pnt)
-					} else if idLP > group[0][1] && idLP < stopIdP {
-						l = append(l, pnt)
-					} else {
-						l = append(l, pnt)
-						ml[i] = append(ml[i], l)
-					}
-				}
-			}
-		}
 	}
 
 	for i, l := range ml {
@@ -280,7 +221,7 @@ func createNodes(c LinesSplitConfig, db *sql.DB, createOnlyEndpoint bool) {
 		log.Fatalln(err)
 	}
 
-	strSql = fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (ogc_fid INTEGER PRIMARY KEY AUTOINCREMENT, lines_fid INTEGER, osm_id BIGINT, line_id INTEGER, order_id INTEGER, pos_type INTEGER DEFAULT 0, intersections INTEGER DEFAULT 0)", c.NodeLayer)
+	strSql = fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (ogc_fid INTEGER PRIMARY KEY AUTOINCREMENT, lines_fid INTEGER, osm_id BIGINT, order_id INTEGER, pos_type INTEGER DEFAULT 0, intersections INTEGER DEFAULT 0)", c.NodeLayer)
 	_, err = db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
