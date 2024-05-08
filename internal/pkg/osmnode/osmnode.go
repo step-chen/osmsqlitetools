@@ -18,8 +18,9 @@ type LinesSplitConfigs struct {
 }
 
 type LinesSplitConfig struct {
-	LineLayer string
-	NodeLayer string
+	LineLayer     string
+	LineNodeLayer string
+	NodeLayer     string
 }
 
 // This function reads the config file and returns the config struct
@@ -39,15 +40,18 @@ func loadConfigs(filename string) LinesSplitConfigs {
 	return conf
 }
 
+// dropTmpTable function drops a temporary table if it exists and then runs VACUUM to clean up the database and free up space
 func dropTmpTable(tblName string, db *sql.DB) {
-	// Drop the temporary table if it exists
+	// Construct the SQL string to drop the table. The "IF EXISTS" clause ensures that the command doesn't fail if the table doesn't exist
 	strSql := fmt.Sprintf("DROP TABLE IF EXISTS %s", tblName)
+
+	// Execute the SQL command to drop the table. If there is an error, log it and exit the program
 	_, err := db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	// Run VACUUM to clean up the database and free up space
+	// Execute the SQL command to run VACUUM to clean up the database and free up space. If there is an error, log it and exit the program
 	_, err = db.Exec("VACUUM;")
 	if err != nil {
 		log.Fatalln(err)
@@ -76,14 +80,15 @@ func createTmpTable(c LinesSplitConfig, db *sql.DB) string {
 	return tblName
 }
 
+// This function creates a temporary table that contains the split nodes, with an index on ogc_fid.
 func SplitLines(strConfigFileName string, db *sql.DB) {
 	conf := loadConfigs(strConfigFileName)
 	for _, c := range conf.Configs {
-		createNodes(c, db, false)
+		createLineNode(c, db, false)
 
 		tmpTblName := createTmpTable(c, db)
 
-		strSql := fmt.Sprintf("SELECT lines_fid, order_id FROM %s WHERE intersections > 1 AND pos_type = 0 ORDER BY lines_fid ASC, order_id ASC", c.NodeLayer)
+		strSql := fmt.Sprintf("SELECT lines_fid, order_id FROM %s WHERE intersections > 1 AND pos_type = 0 ORDER BY lines_fid ASC, order_id ASC", c.LineNodeLayer)
 		rowsNodes, err := db.Query(strSql)
 		if err != nil {
 			log.Fatalln(err)
@@ -101,6 +106,8 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 			rfID     int64
 			orderIDs []int
 		)
+
+		log.Println("Start split line with intersection nodes")
 
 		strCols := getColsSql(tmpTblName, db)
 		for rowsNodes.Next() {
@@ -135,8 +142,12 @@ func SplitLines(strConfigFileName string, db *sql.DB) {
 			log.Fatalln(err)
 		}
 
+		log.Println("Finished split line with intersection nodes")
+
 		dropTmpTable(tmpTblName, db)
-		createNodes(c, db, true)
+		createLineNode(c, db, true)
+		createNode(c, db)
+		createNodeRef(c, db)
 	}
 }
 
@@ -214,14 +225,89 @@ func splitLine(ogcFid int64, points orb.MultiPoint, strCols string, tblName stri
 
 // 332017161 192930 {"type":"LineString","coordinates":[[46.7427034,24.5241916],[46.7480282,24.52049239999999],[46.74831189999999,24.5202774],[46.74895459999999,24.5198424]]}
 // 53433 {"type":"LineString","coordinates":[[46.7482234,24.5207416],[46.7480282,24.52049239999999]]}
-func createNodes(c LinesSplitConfig, db *sql.DB, createOnlyEndpoint bool) {
+func createLineNode(c LinesSplitConfig, db *sql.DB, createOnlyEndpoint bool) {
+	log.Println("Start create line' node")
+
+	strSql := fmt.Sprintf("SELECT DropGeoTable('%s')", c.LineNodeLayer)
+	_, err := db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	strSql = fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (ogc_fid INTEGER PRIMARY KEY AUTOINCREMENT, lines_fid INTEGER, osm_id BIGINT, order_id INTEGER, pos_type INTEGER DEFAULT 0, node_fid INTEGER, intersections INTEGER)", c.LineNodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	strSql = fmt.Sprintf("SELECT AddGeometryColumn('%s', '%s', 4326, 'POINT', 'XY', 1)", c.LineNodeLayer, "GEOMETRY")
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	if createOnlyEndpoint {
+		strSql = fmt.Sprintf(`
+			WITH RECURSIVE nodes (ogc_fid, osm_id, num, order_id, geom) AS (
+				SELECT ogc_fid, osm_id, ST_NumPoints(GEOMETRY), 1, ST_PointN(GEOMETRY, 1) AS geom FROM %s
+			UNION ALL
+				SELECT ogc_fid, osm_id, ST_NumPoints(GEOMETRY), ST_NumPoints(GEOMETRY), ST_PointN(GEOMETRY, ST_NumPoints(GEOMETRY)) AS geom FROM lines
+			)
+			INSERT INTO %s (lines_fid, osm_id, order_id, pos_type, GEOMETRY)
+				SELECT ogc_fid AS lines_fid, osm_id, order_id,
+					CASE WHEN order_id == 1 THEN 1 WHEN order_id == num THEN 2 ELSE 0 END pos_type,
+					geom AS GEOMETRY FROM nodes WHERE geom IS NOT NULL ORDER BY ogc_fid, order_id`,
+			c.LineLayer, c.LineNodeLayer)
+	} else {
+		strSql = fmt.Sprintf(`
+			WITH RECURSIVE nodes(ogc_fid, osm_id, GEOMETRY, i, geom) AS (
+				SELECT ogc_fid, osm_id, GEOMETRY, 0 AS i, NULL as geom FROM %s
+				UNION ALL
+				SELECT ogc_fid, osm_id, GEOMETRY, i+1, ST_PointN(GEOMETRY, i+1) AS geom	FROM nodes
+				WHERE i < ST_NumPoints(GEOMETRY)
+			)
+			INSERT INTO %s (lines_fid, osm_id, order_id, pos_type, GEOMETRY)
+				SELECT ogc_fid AS lines_fid, osm_id, i AS order_id,
+					CASE WHEN i == 1 THEN 1 WHEN i == ST_NumPoints(GEOMETRY) THEN 2 ELSE 0 END pos_type,
+					geom AS GEOMETRY FROM nodes WHERE geom IS NOT NULL ORDER BY ogc_fid, i`,
+			c.LineLayer, c.LineNodeLayer)
+	}
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	strSql = fmt.Sprintf("CREATE INDEX idx_osm_id ON %s (osm_id ASC)", c.LineNodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	strSql = fmt.Sprintf("CREATE INDEX idx_ln_geo ON %s (GEOMETRY ASC)", c.LineNodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	strSql = fmt.Sprintf("SELECT CreateSpatialIndex('%s', '%s')", c.LineNodeLayer, "GEOMETRY")
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	strSql = fmt.Sprintf("UPDATE %s SET intersections = (SELECT COUNT(*) FROM %s AS ln2 WHERE ln2.GEOMETRY = %s.GEOMETRY)", c.LineNodeLayer, c.LineNodeLayer, c.LineNodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	log.Println("Finished create line' node")
+}
+
+func createNode(c LinesSplitConfig, db *sql.DB) {
+	log.Println("Start create node")
+
 	strSql := fmt.Sprintf("SELECT DropGeoTable('%s')", c.NodeLayer)
 	_, err := db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
-
-	strSql = fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (ogc_fid INTEGER PRIMARY KEY AUTOINCREMENT, lines_fid INTEGER, osm_id BIGINT, order_id INTEGER, pos_type INTEGER DEFAULT 0, intersections INTEGER DEFAULT 0)", c.NodeLayer)
+	strSql = fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (ogc_fid INTEGER PRIMARY KEY AUTOINCREMENT, intersections INTEGER)", c.NodeLayer)
 	_, err = db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
@@ -231,47 +317,70 @@ func createNodes(c LinesSplitConfig, db *sql.DB, createOnlyEndpoint bool) {
 	if err != nil {
 		log.Fatalln(err)
 	}
-
-	strSql = fmt.Sprintf(`WITH RECURSIVE split(ogc_fid, osm_id, GEOMETRY, i, geom) AS (
-		SELECT ogc_fid, osm_id, GEOMETRY, 0 AS i, NULL as geom
-		FROM %s
-		UNION ALL
-		SELECT ogc_fid, osm_id, GEOMETRY, i+1, ST_PointN(GEOMETRY, i+1) AS geom
-		FROM split
-		WHERE i < ST_NumPoints(GEOMETRY)
-	)
-	INSERT INTO %s (lines_fid, osm_id, order_id, pos_type, GEOMETRY)
-	SELECT ogc_fid AS lines_fid, osm_id, i AS order_id,
-	CASE
-		WHEN i == 1 THEN 1
-		WHEN i == ST_NumPoints(GEOMETRY) THEN 2
-		ELSE 0
-	END pos_type,
-	geom AS GEOMETRY
-	FROM split
-	WHERE geom IS NOT NULL ORDER BY ogc_fid, i`, c.LineLayer, c.NodeLayer)
+	strSql = fmt.Sprintf(`INSERT INTO %s (intersections, GEOMETRY) SELECT intersections, GEOMETRY FROM %s GROUP BY GEOMETRY`, c.NodeLayer, c.LineNodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	strSql = fmt.Sprintf("CREATE INDEX idx_nodes_geo ON %s (GEOMETRY ASC)", c.NodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	strSql = fmt.Sprintf("SELECT CreateSpatialIndex('%s', '%s')", c.NodeLayer, "GEOMETRY")
 	_, err = db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	strSql = fmt.Sprintf("CREATE INDEX idx_osm_id ON %s (osm_id ASC)", c.NodeLayer)
+	log.Println("Finished create node")
+}
+
+func createNodeRef(c LinesSplitConfig, db *sql.DB) {
+	log.Println("Start create ref between line and node")
+
+	strSql := fmt.Sprintf("UPDATE %s SET node_fid = (SELECT ogc_fid FROM %s WHERE %s.GEOMETRY=%s.GEOMETRY)", c.LineNodeLayer, c.NodeLayer, c.LineNodeLayer, c.NodeLayer)
+	_, err := db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	/*strSql = fmt.Sprintf("UPDATE %s SET intersections = (SELECT COUNT(*) FROM %s WHERE %s.ogc_fid = %s.node_fid)", c.NodeLayer, c.LineNodeLayer, c.NodeLayer, c.LineNodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}*/
+
+	strSql = fmt.Sprintf("SELECT DiscardGeometryColumn('%s', '%s')", c.LineNodeLayer, "GEOMETRY")
 	_, err = db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	strSql = fmt.Sprintf("CREATE INDEX idx_geo ON %s (GEOMETRY ASC)", c.NodeLayer)
+	strSql = fmt.Sprintf("DROP INDEX %s", "idx_ln_geo")
 	_, err = db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	strSql = fmt.Sprintf("UPDATE %s SET intersections = (SELECT COUNT(*) FROM %s AS ln2 WHERE ln2.GEOMETRY = %s.GEOMETRY)", c.NodeLayer, c.NodeLayer, c.NodeLayer)
+	strSql = fmt.Sprintf("ALTER TABLE %s DROP COLUMN GEOMETRY", c.LineNodeLayer)
 	_, err = db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
+
+	strSql = fmt.Sprintf("ALTER TABLE %s DROP COLUMN intersections", c.LineNodeLayer)
+	_, err = db.Exec(strSql)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	// Run VACUUM to clean up the database and free up space
+	_, err = db.Exec("VACUUM;")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	log.Println("Finished create ref between line and node")
 }
 
 func getColsSql(tblName string, db *sql.DB) (strCols string) {

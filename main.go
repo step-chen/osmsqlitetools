@@ -45,7 +45,7 @@ func init() {
 }
 
 func main() {
-	log.SetFlags(log.Lshortfile)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
 	flag.Parse()
 
@@ -69,6 +69,7 @@ func main() {
 		log.Fatalln(err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(16)
 
 	if len(strExtConfPathName) > 0 {
 		OAT.ExtractLines(strExtConfPathName, db)
