@@ -1,4 +1,4 @@
-package osmattr
+package osmnode
 
 import (
 	"database/sql"
@@ -23,7 +23,6 @@ type LinesSplitConfig struct {
 	NodeLayer     string
 }
 
-// This function reads the config file and returns the config struct
 func loadConfigs(filename string) LinesSplitConfigs {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -31,7 +30,6 @@ func loadConfigs(filename string) LinesSplitConfigs {
 	}
 
 	var conf LinesSplitConfigs
-	// Unmarshal the data into the config struct
 	err = yaml.Unmarshal(data, &conf)
 	if err != nil {
 		log.Fatalln(err)
@@ -40,25 +38,19 @@ func loadConfigs(filename string) LinesSplitConfigs {
 	return conf
 }
 
-// dropTmpTable function drops a temporary table if it exists and then runs VACUUM to clean up the database and free up space
 func dropTmpTable(tblName string, db *sql.DB) {
-	// Construct the SQL string to drop the table. The "IF EXISTS" clause ensures that the command doesn't fail if the table doesn't exist
 	strSql := fmt.Sprintf("DROP TABLE IF EXISTS %s", tblName)
-
-	// Execute the SQL command to drop the table. If there is an error, log it and exit the program
 	_, err := db.Exec(strSql)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	// Execute the SQL command to run VACUUM to clean up the database and free up space. If there is an error, log it and exit the program
 	_, err = db.Exec("VACUUM;")
 	if err != nil {
 		log.Fatalln(err)
 	}
 }
 
-// This function creates a temporary table that contains the split lines, with an index on ogc_fid.
 func createTmpTable(c LinesSplitConfig, db *sql.DB) string {
 	tblName := fmt.Sprintf("tmp_%s", c.LineLayer)
 	idxName := fmt.Sprintf("idx_%s", tblName)
@@ -80,7 +72,6 @@ func createTmpTable(c LinesSplitConfig, db *sql.DB) string {
 	return tblName
 }
 
-// This function creates a temporary table that contains the split nodes, with an index on ogc_fid.
 func SplitLines(strConfigFileName string, db *sql.DB) {
 	conf := loadConfigs(strConfigFileName)
 	for _, c := range conf.Configs {
@@ -182,9 +173,9 @@ func split(ogcFid int64, pntIDs []int, strCols string, tblName string, c LinesSp
 	splitLine(ogcFid, splitPnts, strCols, tblName, c, db, tx)
 }
 
-// 10711
 func splitLine(ogcFid int64, points orb.MultiPoint, strCols string, tblName string, c LinesSplitConfig, db *sql.DB, tx *sql.Tx) {
 	strMp := wkt.MarshalString(points)
+
 	strSql := fmt.Sprintf("SELECT ST_AsBinary(ST_LinesCutAtNodes(GEOMETRY, GeomFromText(?, 4326))) FROM %s WHERE ogc_fid == ?", tblName)
 	row := db.QueryRow(strSql, strMp, ogcFid)
 	if row.Err() != nil {
@@ -223,8 +214,6 @@ func splitLine(ogcFid int64, points orb.MultiPoint, strCols string, tblName stri
 	}
 }
 
-// 332017161 192930 {"type":"LineString","coordinates":[[46.7427034,24.5241916],[46.7480282,24.52049239999999],[46.74831189999999,24.5202774],[46.74895459999999,24.5198424]]}
-// 53433 {"type":"LineString","coordinates":[[46.7482234,24.5207416],[46.7480282,24.52049239999999]]}
 func createLineNode(c LinesSplitConfig, db *sql.DB, createOnlyEndpoint bool) {
 	log.Println("Start create line' node")
 
@@ -375,7 +364,6 @@ func createNodeRef(c LinesSplitConfig, db *sql.DB) {
 		log.Fatalln(err)
 	}
 
-	// Run VACUUM to clean up the database and free up space
 	_, err = db.Exec("VACUUM;")
 	if err != nil {
 		log.Fatalln(err)
